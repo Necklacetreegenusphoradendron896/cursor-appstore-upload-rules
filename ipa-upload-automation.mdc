@@ -1,0 +1,1071 @@
+---
+description: Universal IPA upload automation (TestFlight + optional App Store submission) for Flutter, React Native, and native Swift/Xcode projects
+alwaysApply: true
+---
+
+# Universal IPA Upload → TestFlight + App Store Submission
+
+## Chat Trigger — Two Modes
+
+### Mode A: TestFlight Only (no notes, no App Store)
+```
+UPLOAD_IPA_NOW testflight
+```
+- Builds and uploads. No release notes asked. No App Store version touched.
+
+### Mode B: TestFlight + App Store Submission (full flow)
+```
+UPLOAD_IPA_NOW
+What changed
+1- en_us "Bug fixes and performance improvements"
+2- ar_sa "إصلاح الأخطاء وتحسين الأداء"
+3- fr_fr "Corrections de bugs et améliorations"
+```
+- The user can provide **any number of locales** (1 or more). At least one locale is required.
+- If `What changed` block is missing → ask for it before proceeding. Require **at least one** language.
+- Each line format: `N- <locale_alias> "<notes text>"` — the number prefix and quotes are flexible.
+
+#### Locale parsing rules
+
+The user can write locale aliases in any common format. Cursor must normalize them to Apple's `xx-XX` format before calling the API.
+
+**Common aliases (non-exhaustive — handle any valid BCP 47 locale):**
+
+| User writes (case-insensitive) | Normalized to |
+|-------------------------------|---------------|
+| `en_us` / `english` / `en` | `en-US` |
+| `ar_sa` / `arabic` / `ar` | `ar-SA` |
+| `fr_fr` / `french` / `fr` | `fr-FR` |
+| `de_de` / `german` / `de` | `de-DE` |
+| `es_es` / `spanish` / `es` | `es-ES` |
+| `pt_br` / `portuguese` / `pt` | `pt-BR` |
+| `ja` / `japanese` | `ja` |
+| `ko` / `korean` | `ko` |
+| `zh_cn` / `chinese` / `zh` | `zh-Hans` |
+| `zh_tw` | `zh-Hant` |
+| `tr_tr` / `turkish` / `tr` | `tr` |
+| `it_it` / `italian` / `it` | `it` |
+| `nl_nl` / `dutch` / `nl` | `nl-NL` |
+| `ru_ru` / `russian` / `ru` | `ru` |
+| `hi_in` / `hindi` / `hi` | `hi` |
+| Any `xx_YY` format | `xx-YY` (replace underscore with hyphen) |
+
+If the user writes a locale that doesn't match a known alias, convert underscores to hyphens and use as-is (e.g. `sv_SE` -> `sv-SE`). Apple's API will reject invalid locales and Cursor should report the error for that locale without stopping other locales.
+
+**Store parsed locales as an ordered list of `(LOCALE, NOTES)` pairs** to iterate over in Steps 9 and 11.
+
+---
+
+## Required Inputs (ask on first use — remember for subsequent runs)
+
+The user MUST provide these credentials in the chat message. **Never** hardcode them. If any are missing, ask before proceeding.
+
+| Input | How to provide | Example |
+|-------|----------------|---------|
+| **Key ID** | In the trigger message or when asked | `KEY_ID: ABC123DEFG` |
+| **Issuer ID** | In the trigger message or when asked | `ISSUER_ID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
+| **.p8 private key** | Paste the full PEM block or provide file path | `-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----` |
+| **Framework** | In the trigger message or when asked | `flutter` / `react-native` / `swift` |
+
+### How to ask for missing inputs
+
+If any of the four required inputs are missing from the trigger message, ask **one clear question** listing everything that's missing:
+
+```
+Before I can build and upload, I need these details:
+
+1. Framework: flutter / react-native / swift
+2. Key ID: (your App Store Connect API Key ID)
+3. Issuer ID: (your App Store Connect API Issuer ID)
+4. .p8 key: (paste the full private key or provide the file path)
+
+Please provide the missing ones.
+```
+
+Once provided, store them as shell variables: `$KEY_ID`, `$ISSUER_ID`, `$P8_KEY` (the key content), `$FRAMEWORK`.
+
+---
+
+## Framework Detection & Build Configuration
+
+| Framework | Trigger value (case-insensitive) | Build command | IPA search path |
+|-----------|----------------------------------|---------------|-----------------|
+| **Flutter** | `flutter` | `flutter build ipa` | `build/ios/ipa/` |
+| **React Native** | `react-native` / `reactnative` / `rn` | `xcodebuild archive` + `xcodebuild -exportArchive` | `build/ios/ipa/` (custom export path) |
+| **Native Swift/Xcode** | `swift` / `native` / `xcode` / `ios` | `xcodebuild archive` + `xcodebuild -exportArchive` | `build/ios/ipa/` (custom export path) |
+
+---
+
+## Mode A steps: 1 → 2 → 3 → 4 → 4b → 5 (report)
+## Mode B steps: 1 → 2 → 3 → 4 → 4b → 6 → 7 → 8 → 9 → 10 → 10b → 11 → 12 → 13 (report)
+
+---
+
+## Steps
+
+### Step 0 — Collect credentials and framework
+
+Before anything, ensure you have all four required inputs (`KEY_ID`, `ISSUER_ID`, `P8_KEY`, `FRAMEWORK`). If any are missing from the trigger message, ask the user (see "How to ask for missing inputs" above). **Do not proceed until all four are provided.**
+
+Normalize framework value:
+- `flutter` → `flutter`
+- `react-native` / `reactnative` / `rn` → `react-native`
+- `swift` / `native` / `xcode` / `ios` → `swift`
+
+---
+
+### Step 1 — Fix Export Compliance (one-time, permanent)
+
+Locate the project's `Info.plist` and ensure it contains `ITSAppUsesNonExemptEncryption`:
+
+**Flutter:** `ios/Runner/Info.plist`
+**React Native:** `ios/<ProjectName>/Info.plist`
+**Native Swift:** Find via `find ios -name "Info.plist" -not -path "*/Pods/*" | head -1` or use the main target's Info.plist.
+
+```bash
+PLIST_PATH="<resolved Info.plist path>"
+if ! grep -q "ITSAppUsesNonExemptEncryption" "$PLIST_PATH"; then
+  sed -i '' 's|</dict>|<key>ITSAppUsesNonExemptEncryption</key><false/>\n</dict>|' "$PLIST_PATH"
+  echo "Added ITSAppUsesNonExemptEncryption=false to $PLIST_PATH"
+else
+  echo "Export compliance key already present — skipping"
+fi
+```
+
+---
+
+### Step 2 — Build the IPA
+
+#### Flutter
+```bash
+flutter build ipa
+```
+IPA is written to `build/ios/ipa/`.
+
+#### React Native
+Two-step process using xcodebuild. First, detect the workspace and scheme:
+```bash
+WORKSPACE=$(find ios -name "*.xcworkspace" -not -path "*/Pods/*" | head -1)
+SCHEME=$(xcodebuild -list -workspace "$WORKSPACE" 2>/dev/null | awk '/Schemes:/,/^$/' | grep -v "Schemes:" | head -1 | xargs)
+ARCHIVE_PATH="build/ios/archive/App.xcarchive"
+EXPORT_PATH="build/ios/ipa"
+
+mkdir -p build/ios/ipa
+
+xcodebuild clean archive \
+  -workspace "$WORKSPACE" \
+  -scheme "$SCHEME" \
+  -configuration Release \
+  -archivePath "$ARCHIVE_PATH" \
+  CODE_SIGN_STYLE=Automatic
+```
+Then export:
+```bash
+cat > /tmp/ExportOptions.plist << 'EXPORTEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>method</key>
+    <string>app-store-connect</string>
+    <key>signingStyle</key>
+    <string>automatic</string>
+    <key>stripSwiftSymbols</key>
+    <true/>
+    <key>uploadSymbols</key>
+    <true/>
+</dict>
+</plist>
+EXPORTEOF
+
+xcodebuild -exportArchive \
+  -archivePath "$ARCHIVE_PATH" \
+  -exportPath "$EXPORT_PATH" \
+  -exportOptionsPlist /tmp/ExportOptions.plist
+
+rm -f /tmp/ExportOptions.plist
+```
+
+#### Native Swift / Xcode
+Same two-step process. Detect project or workspace:
+```bash
+WORKSPACE=$(find . -maxdepth 1 -name "*.xcworkspace" | head -1)
+if [ -z "$WORKSPACE" ]; then
+  PROJECT=$(find . -maxdepth 1 -name "*.xcodeproj" | head -1)
+  BUILD_TARGET="-project $PROJECT"
+else
+  BUILD_TARGET="-workspace $WORKSPACE"
+fi
+SCHEME=$(xcodebuild -list $BUILD_TARGET 2>/dev/null | awk '/Schemes:/,/^$/' | grep -v "Schemes:" | head -1 | xargs)
+ARCHIVE_PATH="build/ios/archive/App.xcarchive"
+EXPORT_PATH="build/ios/ipa"
+
+mkdir -p build/ios/ipa
+
+xcodebuild clean archive \
+  $BUILD_TARGET \
+  -scheme "$SCHEME" \
+  -configuration Release \
+  -archivePath "$ARCHIVE_PATH" \
+  CODE_SIGN_STYLE=Automatic
+```
+Then export (same ExportOptions.plist and exportArchive command as React Native above).
+
+**For all frameworks:** Report build duration. If the build fails, stop and report the error.
+
+---
+
+### Step 3 — Extract bundle info from the IPA
+```bash
+IPA_PATH=$(find build/ios/ipa -name "*.ipa" | head -1)
+if [ -z "$IPA_PATH" ]; then
+  echo "ERROR: No .ipa file found in build/ios/ipa/"
+  exit 1
+fi
+APP_BUNDLE=$(unzip -Z1 "$IPA_PATH" | sed -n 's/^Payload\/\([^/]*\.app\)\/Info\.plist$/\1/p' | sed -n '1p')
+TMP_PLIST=$(mktemp)
+unzip -p "$IPA_PATH" "Payload/$APP_BUNDLE/Info.plist" > "$TMP_PLIST"
+BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$TMP_PLIST")
+VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$TMP_PLIST")
+BUILD_NUMBER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$TMP_PLIST")
+rm -f "$TMP_PLIST"
+echo "Bundle: $BUNDLE_ID | Version: $VERSION | Build: $BUILD_NUMBER"
+```
+
+---
+
+### Step 4 — Write the .p8 key to a temp file
+
+Use the `$KEY_ID`, `$ISSUER_ID`, and `$P8_KEY` provided by the user:
+```bash
+cat > /tmp/AuthKey_${KEY_ID}.p8 << 'EOF'
+<P8_KEY content from user>
+EOF
+chmod 600 /tmp/AuthKey_${KEY_ID}.p8
+```
+
+---
+
+### Step 4b — Upload with altool
+
+> This can take 10-20 minutes. Do NOT kill the process if it appears to hang — altool is still uploading.
+```bash
+xcrun altool --upload-app \
+  -f "$IPA_PATH" \
+  --apiKey $KEY_ID \
+  --apiIssuer $ISSUER_ID \
+  --p8-file-path /tmp/AuthKey_${KEY_ID}.p8
+```
+**Stop if exit code != 0 or output does not contain `No errors uploading` / `UPLOAD SUCCEEDED`. Clean up key and report error.**
+
+---
+
+### Step 5 (Mode A only) — Clean up and report
+```bash
+rm -f /tmp/AuthKey_${KEY_ID}.p8
+```
+**Mode A ends here. Print the Step Report (see bottom of file).**
+
+---
+
+### Step 6 (Mode B) — Generate App Store Connect API JWT using Python
+
+The shell-only openssl approach does NOT produce a valid ES256 JWT. Use Python PyJWT instead:
+```bash
+pip3 install PyJWT cryptography --quiet 2>/dev/null || true
+
+JWT=$(python3 << 'PYEOF'
+import jwt, time
+
+KEY_ID = "$KEY_ID"
+ISSUER_ID = "$ISSUER_ID"
+
+with open("/tmp/AuthKey_${KEY_ID}.p8", "r") as f:
+    private_key = f.read()
+
+token = jwt.encode(
+    {
+        "iss": ISSUER_ID,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 1200,
+        "aud": "appstoreconnect-v1",
+    },
+    private_key,
+    algorithm="ES256",
+    headers={"kid": KEY_ID, "typ": "JWT"},
+)
+print(token)
+PYEOF
+)
+
+echo "JWT generated: ${JWT:0:20}..."
+```
+If JWT is empty or Python errors out: stop, clean up key, report. PyJWT must succeed before any API calls.
+
+---
+
+### Step 7 (Mode B) — Resolve App ID from bundle ID
+```bash
+APP_RESPONSE=$(curl -s \
+  -H "Authorization: Bearer $JWT" \
+  "https://api.appstoreconnect.apple.com/v1/apps?filter[bundleId]=$BUNDLE_ID")
+
+APP_ID=$(echo "$APP_RESPONSE" | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+if data: print(data[0]['id'])
+" 2>/dev/null)
+
+echo "App ID: $APP_ID"
+```
+If APP_ID is empty: stop, clean up key, report the full API response. Do not proceed.
+
+---
+
+### Step 8 (Mode B) — Poll until build appears in App Store Connect (max ~20 min)
+
+> Apple processing after a large upload can take 10-15 minutes. Poll for up to 20 minutes before giving up.
+```bash
+BUILD_ID=""
+for i in $(seq 1 120); do
+  BUILD_ID=$(curl -s \
+    -H "Authorization: Bearer $JWT" \
+    "https://api.appstoreconnect.apple.com/v1/builds?filter[app]=$APP_ID&filter[version]=$BUILD_NUMBER&filter[preReleaseVersion.version]=$VERSION" \
+    | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+for b in data:
+    if b['attributes']['processingState'] not in ('FAILED', 'INVALID'):
+        print(b['id'])
+        break
+" 2>/dev/null)
+  [ -n "$BUILD_ID" ] && break
+  echo "Waiting for build in App Store Connect... ($i/120, ~$((i * 10))s elapsed)"
+  sleep 10
+done
+
+if [ -z "$BUILD_ID" ]; then
+  rm -f /tmp/AuthKey_${KEY_ID}.p8
+  echo "ERROR: Build not found after 20 minutes. Upload succeeded — complete Steps 9-13 manually in App Store Connect."
+  exit 1
+fi
+echo "Build ID: $BUILD_ID"
+```
+
+---
+
+### Step 9 (Mode B) — Set TestFlight "What to Test" — all user-provided locales
+
+Loop over **every** `(LOCALE, NOTES)` pair parsed from the user's `What changed` block. Call `set_beta_localization` once per locale.
+
+```bash
+set_beta_localization() {
+  local LOCALE="$1"
+  local NOTES="$2"
+  local NOTES_JSON=$(printf '%s' "$NOTES" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+
+  local LOC_ID=$(curl -s \
+    -H "Authorization: Bearer $JWT" \
+    "https://api.appstoreconnect.apple.com/v1/builds/$BUILD_ID/betaBuildLocalizations" \
+    | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+for loc in data:
+    if loc['attributes']['locale'] == '$LOCALE':
+        print(loc['id'])
+        break
+" 2>/dev/null)
+
+  if [ -n "$LOC_ID" ]; then
+    curl -s --fail -X PATCH \
+      -H "Authorization: Bearer $JWT" \
+      -H "Content-Type: application/json" \
+      -d "{\"data\":{\"id\":\"$LOC_ID\",\"type\":\"betaBuildLocalizations\",\"attributes\":{\"whatsNew\":$NOTES_JSON}}}" \
+      "https://api.appstoreconnect.apple.com/v1/betaBuildLocalizations/$LOC_ID" > /dev/null
+    echo "TestFlight 'What to Test' updated ($LOCALE)"
+  else
+    RESULT=$(curl -s -w "\n%{http_code}" -X POST \
+      -H "Authorization: Bearer $JWT" \
+      -H "Content-Type: application/json" \
+      -d "{\"data\":{\"type\":\"betaBuildLocalizations\",\"attributes\":{\"locale\":\"$LOCALE\",\"whatsNew\":$NOTES_JSON},\"relationships\":{\"build\":{\"data\":{\"id\":\"$BUILD_ID\",\"type\":\"builds\"}}}}}" \
+      "https://api.appstoreconnect.apple.com/v1/betaBuildLocalizations")
+    HTTP=$(echo "$RESULT" | tail -1)
+    if [ "$HTTP" = "201" ]; then
+      echo "TestFlight 'What to Test' created ($LOCALE)"
+    elif [ "$HTTP" = "409" ]; then
+      LOC_ID=$(curl -s \
+        -H "Authorization: Bearer $JWT" \
+        "https://api.appstoreconnect.apple.com/v1/builds/$BUILD_ID/betaBuildLocalizations" \
+        | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+for loc in data:
+    if loc['attributes']['locale'] == '$LOCALE':
+        print(loc['id'])
+        break
+" 2>/dev/null)
+      curl -s --fail -X PATCH \
+        -H "Authorization: Bearer $JWT" \
+        -H "Content-Type: application/json" \
+        -d "{\"data\":{\"id\":\"$LOC_ID\",\"type\":\"betaBuildLocalizations\",\"attributes\":{\"whatsNew\":$NOTES_JSON}}}" \
+        "https://api.appstoreconnect.apple.com/v1/betaBuildLocalizations/$LOC_ID" > /dev/null
+      echo "TestFlight 'What to Test' patched after 409 ($LOCALE)"
+    else
+      echo "TestFlight localization failed HTTP $HTTP ($LOCALE)"
+    fi
+  fi
+}
+
+# Call once per locale from the user's "What changed" block:
+# set_beta_localization "<LOCALE_1>" "<notes_1>"
+# set_beta_localization "<LOCALE_2>" "<notes_2>"
+# ... repeat for every locale the user provided
+for each (LOCALE, NOTES) pair parsed from user input:
+  set_beta_localization "$LOCALE" "$NOTES"
+```
+
+---
+
+### Step 10 (Mode B) — Create or reuse App Store Version
+
+> **Version state handling (all scenarios):**
+> - Scenario 1 (new version): No matching version exists -> create one.
+> - Scenario 2 (new build, version exists, never submitted): Version in PREPARE_FOR_SUBMISSION -> reuse directly.
+> - Scenario 3 (new build, previous was rejected by Apple): Version in REJECTED / METADATA_REJECTED -> reuse, cancel UNRESOLVED_ISSUES submission in 10b.
+> - Scenario 4 (new build, developer removed version from review): Version in DEVELOPER_REJECTED -> reuse, cancel any lingering submissions in 10b.
+> - Scenario 5 (new build, previous in review / waiting for review): Version in WAITING_FOR_REVIEW / IN_REVIEW -> cancel its submission in 10b, version transitions to DEVELOPER_REJECTED, then reuse.
+> - Scenario 6 (new build, Apple approved but not released): Version in PENDING_DEVELOPER_RELEASE / PENDING_APPLE_RELEASE -> cancel submission in 10b, version transitions to DEVELOPER_REJECTED, then reuse.
+> - Scenario 7 (new build, draft version with stale submission): Version in PREPARE_FOR_SUBMISSION but a READY_FOR_REVIEW submission exists -> 10b cancels stale sub, proceed normally.
+>
+> **Editable states:** PREPARE_FOR_SUBMISSION, DEVELOPER_REJECTED, REJECTED, METADATA_REJECTED, INVALID_BINARY. Versions in WAITING_FOR_REVIEW / IN_REVIEW must have their submission canceled first.
+
+```bash
+ALL_VERSIONS_RESP=$(curl -s \
+  -H "Authorization: Bearer $JWT" \
+  "https://api.appstoreconnect.apple.com/v1/apps/$APP_ID/appStoreVersions?filter[platform]=IOS")
+
+read VERSION_ID VERSION_STATE <<< $(echo "$ALL_VERSIONS_RESP" | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+actionable = {
+    'PREPARE_FOR_SUBMISSION', 'READY_FOR_REVIEW',
+    'DEVELOPER_REJECTED', 'REJECTED', 'METADATA_REJECTED', 'INVALID_BINARY',
+    'WAITING_FOR_REVIEW', 'IN_REVIEW', 'ACCEPTED',
+    'PENDING_DEVELOPER_RELEASE', 'PENDING_APPLE_RELEASE',
+    'WAITING_FOR_EXPORT_COMPLIANCE'
+}
+version = '$VERSION'
+for v in data:
+    vs = v['attributes'].get('versionString', '')
+    state = v['attributes'].get('appStoreState', '') or v['attributes'].get('appVersionState', '')
+    if vs == version and state in actionable:
+        print(v['id'], state)
+        break
+" 2>/dev/null)
+
+if [ -n "$VERSION_ID" ]; then
+  echo "Found existing App Store version $VERSION (ID: $VERSION_ID, state: $VERSION_STATE)"
+else
+  CREATE_RESP=$(curl -s -w "\n%{http_code}" -X POST \
+    -H "Authorization: Bearer $JWT" \
+    -H "Content-Type: application/json" \
+    -d "{\"data\":{\"type\":\"appStoreVersions\",\"attributes\":{\"platform\":\"IOS\",\"versionString\":\"$VERSION\"},\"relationships\":{\"app\":{\"data\":{\"id\":\"$APP_ID\",\"type\":\"apps\"}}}}}" \
+    "https://api.appstoreconnect.apple.com/v1/appStoreVersions")
+  HTTP=$(echo "$CREATE_RESP" | tail -1)
+  BODY=$(echo "$CREATE_RESP" | sed '$d')
+  if [ "$HTTP" = "201" ]; then
+    VERSION_ID=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
+    VERSION_STATE="PREPARE_FOR_SUBMISSION"
+    echo "Created new App Store version $VERSION (ID: $VERSION_ID)"
+  else
+    rm -f /tmp/AuthKey_${KEY_ID}.p8
+    echo "Failed to create App Store version (HTTP $HTTP): $BODY"
+    exit 1
+  fi
+fi
+```
+
+---
+
+### Step 10b (Mode B) — Cancel any blocking review submissions for this version
+
+> PATCH the submission with `{"canceled": true}`. The submission transitions to CANCELING -> COMPLETE. The version transitions to DEVELOPER_REJECTED. After canceling, poll until the version returns to an editable state.
+
+```bash
+NEEDS_CANCEL="false"
+ACTIVE_SUBMISSION_STATES="WAITING_FOR_REVIEW IN_REVIEW READY_FOR_REVIEW ACCEPTED PENDING_DEVELOPER_RELEASE PENDING_APPLE_RELEASE WAITING_FOR_EXPORT_COMPLIANCE"
+for cs in $ACTIVE_SUBMISSION_STATES; do
+  if [ "$VERSION_STATE" = "$cs" ]; then
+    NEEDS_CANCEL="true"
+    break
+  fi
+done
+
+REJECTED_STATES="REJECTED DEVELOPER_REJECTED METADATA_REJECTED INVALID_BINARY"
+for rs in $REJECTED_STATES; do
+  if [ "$VERSION_STATE" = "$rs" ]; then
+    NEEDS_CANCEL="true"
+    break
+  fi
+done
+
+if [ "$NEEDS_CANCEL" = "true" ]; then
+  echo "Step 10b: Version is in state $VERSION_STATE — checking for blocking submissions..."
+
+  ALL_SUBS=$(curl -s \
+    -H "Authorization: Bearer $JWT" \
+    "https://api.appstoreconnect.apple.com/v1/apps/$APP_ID/reviewSubmissions")
+
+  BLOCKING_SUB_IDS=$(echo "$ALL_SUBS" | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+cancellable = {'READY_FOR_REVIEW', 'WAITING_FOR_REVIEW', 'IN_REVIEW', 'UNRESOLVED_ISSUES'}
+for s in data:
+    if s['attributes']['state'] in cancellable:
+        print(s['id'])
+" 2>/dev/null)
+
+  if [ -z "$BLOCKING_SUB_IDS" ]; then
+    echo "No cancellable submissions found despite version state $VERSION_STATE — proceeding"
+  else
+    for SUB_ID in $BLOCKING_SUB_IDS; do
+      echo "  Canceling review submission $SUB_ID..."
+      CANCEL_RESP=$(curl -s -w "\n%{http_code}" -X PATCH \
+        -H "Authorization: Bearer $JWT" \
+        -H "Content-Type: application/json" \
+        -d "{\"data\":{\"id\":\"$SUB_ID\",\"type\":\"reviewSubmissions\",\"attributes\":{\"canceled\":true}}}" \
+        "https://api.appstoreconnect.apple.com/v1/reviewSubmissions/$SUB_ID")
+      CANCEL_HTTP=$(echo "$CANCEL_RESP" | tail -1)
+      CANCEL_BODY=$(echo "$CANCEL_RESP" | sed '$d')
+      echo "  Request: PATCH /v1/reviewSubmissions/$SUB_ID {canceled:true}"
+      echo "  Response HTTP: $CANCEL_HTTP"
+      echo "  Response Body: $CANCEL_BODY"
+      if [ "$CANCEL_HTTP" = "200" ]; then
+        echo "  Submission $SUB_ID canceled"
+      else
+        echo "  Cancel returned HTTP $CANCEL_HTTP (may already be transitioning) — continuing"
+      fi
+    done
+
+    echo "  Waiting for version to transition to editable state..."
+    for i in $(seq 1 24); do
+      sleep 5
+      NEW_STATE=$(curl -s \
+        -H "Authorization: Bearer $JWT" \
+        "https://api.appstoreconnect.apple.com/v1/appStoreVersions/$VERSION_ID" \
+        | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('data', {})
+attrs = d.get('attributes', {})
+print(attrs.get('appStoreState', '') or attrs.get('appVersionState', ''))
+" 2>/dev/null)
+      echo "  Version state: $NEW_STATE (~$((i * 5))s elapsed)"
+      EDITABLE_STATES="PREPARE_FOR_SUBMISSION DEVELOPER_REJECTED REJECTED METADATA_REJECTED INVALID_BINARY"
+      for es in $EDITABLE_STATES; do
+        if [ "$NEW_STATE" = "$es" ]; then
+          VERSION_STATE="$NEW_STATE"
+          break 2
+        fi
+      done
+    done
+    echo "Step 10b complete — version now in state: $VERSION_STATE"
+  fi
+else
+  echo "Step 10b: No cancellation needed (version state: $VERSION_STATE)"
+fi
+```
+
+---
+
+### Step 11 (Mode B) — Set App Store "What's New" — all user-provided locales
+
+> Retry with backoff up to 60 seconds for 409 state conflicts after cancellation.
+
+Loop over **every** `(LOCALE, NOTES)` pair parsed from the user's `What changed` block. Call `set_store_localization` once per locale.
+
+```bash
+set_store_localization() {
+  local LOCALE="$1"
+  local NOTES="$2"
+  local NOTES_JSON=$(printf '%s' "$NOTES" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+  local SUCCESS="false"
+
+  for attempt in 1 2 3 4 5 6; do
+    local LOC_ID=$(curl -s \
+      -H "Authorization: Bearer $JWT" \
+      "https://api.appstoreconnect.apple.com/v1/appStoreVersions/$VERSION_ID/appStoreVersionLocalizations" \
+      | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+for loc in data:
+    if loc['attributes']['locale'] == '$LOCALE':
+        print(loc['id'])
+        break
+" 2>/dev/null)
+
+    if [ -n "$LOC_ID" ]; then
+      RESULT=$(curl -s -w "\n%{http_code}" -X PATCH \
+        -H "Authorization: Bearer $JWT" \
+        -H "Content-Type: application/json" \
+        -d "{\"data\":{\"id\":\"$LOC_ID\",\"type\":\"appStoreVersionLocalizations\",\"attributes\":{\"whatsNew\":$NOTES_JSON}}}" \
+        "https://api.appstoreconnect.apple.com/v1/appStoreVersionLocalizations/$LOC_ID")
+      HTTP=$(echo "$RESULT" | tail -1)
+      if [ "$HTTP" = "200" ]; then
+        echo "App Store 'What's New' updated ($LOCALE)"
+        SUCCESS="true"
+        break
+      elif [ "$HTTP" = "409" ] && [ "$attempt" -lt 6 ]; then
+        WAIT=$((5 + (attempt - 1) * 3))
+        echo "  PATCH returned 409 for $LOCALE (attempt $attempt/6) — retrying in ${WAIT}s..."
+        sleep $WAIT
+        continue
+      else
+        echo "App Store localization PATCH failed HTTP $HTTP ($LOCALE): $(echo "$RESULT" | sed '$d')"
+        break
+      fi
+    else
+      RESULT=$(curl -s -w "\n%{http_code}" -X POST \
+        -H "Authorization: Bearer $JWT" \
+        -H "Content-Type: application/json" \
+        -d "{\"data\":{\"type\":\"appStoreVersionLocalizations\",\"attributes\":{\"locale\":\"$LOCALE\",\"whatsNew\":$NOTES_JSON},\"relationships\":{\"appStoreVersion\":{\"data\":{\"id\":\"$VERSION_ID\",\"type\":\"appStoreVersions\"}}}}}" \
+        "https://api.appstoreconnect.apple.com/v1/appStoreVersionLocalizations")
+      HTTP=$(echo "$RESULT" | tail -1)
+      if [ "$HTTP" = "201" ]; then
+        echo "App Store 'What's New' created ($LOCALE)"
+        SUCCESS="true"
+        break
+      elif [ "$HTTP" = "409" ] && [ "$attempt" -lt 6 ]; then
+        WAIT=$((5 + (attempt - 1) * 3))
+        echo "  POST returned 409 for $LOCALE (attempt $attempt/6) — retrying in ${WAIT}s..."
+        sleep $WAIT
+        continue
+      else
+        echo "App Store localization POST failed HTTP $HTTP ($LOCALE): $(echo "$RESULT" | sed '$d')"
+        break
+      fi
+    fi
+  done
+
+  if [ "$SUCCESS" != "true" ]; then
+    echo "Could not set What's New for $LOCALE after 6 attempts — will continue (non-fatal)"
+  fi
+}
+
+# Call once per locale from the user's "What changed" block:
+# set_store_localization "<LOCALE_1>" "<notes_1>"
+# set_store_localization "<LOCALE_2>" "<notes_2>"
+# ... repeat for every locale the user provided
+for each (LOCALE, NOTES) pair parsed from user input:
+  set_store_localization "$LOCALE" "$NOTES"
+```
+
+---
+
+### Step 12 (Mode B) — Attach build to App Store version
+```bash
+ATTACH_RESP=$(curl -s -w "\n%{http_code}" -X PATCH \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d "{\"data\":{\"id\":\"$VERSION_ID\",\"type\":\"appStoreVersions\",\"relationships\":{\"build\":{\"data\":{\"id\":\"$BUILD_ID\",\"type\":\"builds\"}}}}}" \
+  "https://api.appstoreconnect.apple.com/v1/appStoreVersions/$VERSION_ID")
+
+HTTP=$(echo "$ATTACH_RESP" | tail -1)
+if [ "$HTTP" = "200" ]; then
+  echo "Build attached to version"
+else
+  echo "Attach build failed (HTTP $HTTP): $(echo "$ATTACH_RESP" | head -1)"
+fi
+```
+
+---
+
+### Step 13 (Mode B) — Submit for review + clean up
+
+> The old `POST /v1/appStoreVersionSubmissions` endpoint is **deprecated** (removed in ASC API 1.7).
+> **Never** use it — it returns 403 FORBIDDEN_ERROR.
+>
+> Use the new `reviewSubmissions` flow:
+>   **13-pre.** Cancel ALL existing in-progress submissions and remove our version from any stale submission
+>   **13a.** Create a fresh review submission
+>   **13b.** Add the App Store version as a review submission item
+>   **13c.** PATCH the submission with `submitted: true` to trigger review
+
+```bash
+# -- Step 13-pre: Clear ALL blocking review submissions --
+echo "Step 13-pre: Clearing any blocking review submissions..."
+
+ALL_SUBS=$(curl -s \
+  -H "Authorization: Bearer $JWT" \
+  "https://api.appstoreconnect.apple.com/v1/apps/$APP_ID/reviewSubmissions")
+
+BLOCKING_SUBS=$(echo "$ALL_SUBS" | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+blocking = {'READY_FOR_REVIEW', 'WAITING_FOR_REVIEW', 'IN_REVIEW', 'UNRESOLVED_ISSUES'}
+for s in data:
+    state = s['attributes']['state']
+    if state in blocking:
+        print(s['id'], state)
+" 2>/dev/null)
+
+CANCELED_COUNT=0
+if [ -n "$BLOCKING_SUBS" ]; then
+  echo "$BLOCKING_SUBS" | while read SUB_ID SUB_STATE; do
+    echo "  Found blocking submission $SUB_ID (state: $SUB_STATE) — canceling..."
+
+    ITEMS_RESP=$(curl -s \
+      -H "Authorization: Bearer $JWT" \
+      "https://api.appstoreconnect.apple.com/v1/reviewSubmissions/$SUB_ID/items")
+
+    ITEM_IDS_TO_REMOVE=$(echo "$ITEMS_RESP" | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+version_id = '$VERSION_ID'
+for item in data:
+    rels = item.get('relationships', {})
+    asv = rels.get('appStoreVersion', {}).get('data', {})
+    if asv.get('id') == version_id:
+        print(item['id'])
+" 2>/dev/null)
+
+    if [ -n "$ITEM_IDS_TO_REMOVE" ]; then
+      for ITEM_ID in $ITEM_IDS_TO_REMOVE; do
+        echo "    Removing version item $ITEM_ID from submission $SUB_ID..."
+        DEL_RESP=$(curl -s -w "\n%{http_code}" -X DELETE \
+          -H "Authorization: Bearer $JWT" \
+          "https://api.appstoreconnect.apple.com/v1/reviewSubmissionItems/$ITEM_ID")
+        DEL_HTTP=$(echo "$DEL_RESP" | tail -1)
+        echo "    DELETE /v1/reviewSubmissionItems/$ITEM_ID -> HTTP $DEL_HTTP"
+      done
+    fi
+
+    CANCEL_RESP=$(curl -s -w "\n%{http_code}" -X PATCH \
+      -H "Authorization: Bearer $JWT" \
+      -H "Content-Type: application/json" \
+      -d "{\"data\":{\"id\":\"$SUB_ID\",\"type\":\"reviewSubmissions\",\"attributes\":{\"canceled\":true}}}" \
+      "https://api.appstoreconnect.apple.com/v1/reviewSubmissions/$SUB_ID")
+    CANCEL_HTTP=$(echo "$CANCEL_RESP" | tail -1)
+    CANCEL_BODY=$(echo "$CANCEL_RESP" | sed '$d')
+    echo "    PATCH /v1/reviewSubmissions/$SUB_ID {canceled:true} -> HTTP $CANCEL_HTTP"
+    if [ "$CANCEL_HTTP" = "200" ]; then
+      echo "    Submission $SUB_ID canceled"
+    elif [ "$CANCEL_HTTP" = "409" ]; then
+      echo "    Submission $SUB_ID returned 409 on cancel (already transitioning or completed)"
+    else
+      echo "    Unexpected HTTP $CANCEL_HTTP on cancel — continuing"
+    fi
+  done
+
+  echo "  Waiting for cancellations to settle..."
+  for i in $(seq 1 12); do
+    sleep 5
+    STILL_BLOCKING=$(curl -s \
+      -H "Authorization: Bearer $JWT" \
+      "https://api.appstoreconnect.apple.com/v1/apps/$APP_ID/reviewSubmissions" \
+      | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+blocking = {'READY_FOR_REVIEW', 'WAITING_FOR_REVIEW', 'IN_REVIEW', 'UNRESOLVED_ISSUES', 'CANCELING'}
+count = sum(1 for s in data if s['attributes']['state'] in blocking)
+print(count)
+" 2>/dev/null)
+    if [ "$STILL_BLOCKING" = "0" ] || [ -z "$STILL_BLOCKING" ]; then
+      echo "  All blocking submissions cleared (~$((i * 5))s)"
+      break
+    fi
+    echo "  Still $STILL_BLOCKING blocking submissions (~$((i * 5))s)..."
+    if [ "$i" = "12" ]; then
+      echo "  Timed out waiting for submissions to clear after 60s — proceeding anyway"
+    fi
+  done
+else
+  echo "  No blocking submissions found"
+fi
+
+NEW_VS=$(curl -s \
+  -H "Authorization: Bearer $JWT" \
+  "https://api.appstoreconnect.apple.com/v1/appStoreVersions/$VERSION_ID" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('data', {})
+attrs = d.get('attributes', {})
+print(attrs.get('appStoreState', '') or attrs.get('appVersionState', ''))
+" 2>/dev/null)
+echo "  Version state after pre-cleanup: $NEW_VS"
+
+# -- Step 13a: Create a FRESH review submission --
+echo "Step 13a: Creating new review submission..."
+
+CREATE_SUB_RESP=$(curl -s -w "\n%{http_code}" -X POST \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d "{\"data\":{\"type\":\"reviewSubmissions\",\"relationships\":{\"app\":{\"data\":{\"id\":\"$APP_ID\",\"type\":\"apps\"}}}}}" \
+  "https://api.appstoreconnect.apple.com/v1/reviewSubmissions")
+
+CREATE_SUB_HTTP=$(echo "$CREATE_SUB_RESP" | tail -1)
+CREATE_SUB_BODY=$(echo "$CREATE_SUB_RESP" | sed '$d')
+
+echo "Request:"
+echo "  POST https://api.appstoreconnect.apple.com/v1/reviewSubmissions"
+echo "  Body: {\"data\":{\"type\":\"reviewSubmissions\",\"relationships\":{\"app\":{\"data\":{\"id\":\"$APP_ID\",\"type\":\"apps\"}}}}}"
+echo "Response HTTP: $CREATE_SUB_HTTP"
+echo "Response Body: $CREATE_SUB_BODY"
+
+if [ "$CREATE_SUB_HTTP" = "201" ]; then
+  REVIEW_SUBMISSION_ID=$(echo "$CREATE_SUB_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])" 2>/dev/null)
+  echo "Review submission created (ID: $REVIEW_SUBMISSION_ID)"
+elif [ "$CREATE_SUB_HTTP" = "409" ]; then
+  echo "Create returned 409 — looking for a reusable existing submission..."
+  REUSE_SUBS=$(curl -s \
+    -H "Authorization: Bearer $JWT" \
+    "https://api.appstoreconnect.apple.com/v1/apps/$APP_ID/reviewSubmissions")
+  REVIEW_SUBMISSION_ID=$(echo "$REUSE_SUBS" | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+for s in data:
+    if s['attributes']['state'] == 'READY_FOR_REVIEW':
+        print(s['id'])
+        break
+" 2>/dev/null)
+  if [ -n "$REVIEW_SUBMISSION_ID" ]; then
+    echo "Reusing existing READY_FOR_REVIEW submission (ID: $REVIEW_SUBMISSION_ID)"
+  else
+    rm -f /tmp/AuthKey_${KEY_ID}.p8
+    echo "Step 13a failed — 409 on create and no READY_FOR_REVIEW submission found."
+    echo "   Check App Store Connect manually for stuck submissions."
+    exit 1
+  fi
+else
+  rm -f /tmp/AuthKey_${KEY_ID}.p8
+  echo "Step 13a failed — could not create review submission (HTTP $CREATE_SUB_HTTP): $CREATE_SUB_BODY"
+  exit 1
+fi
+
+# -- Step 13b: Add App Store version as item --
+echo "Step 13b: Adding App Store version to review submission..."
+ADD_ITEM_RESP=$(curl -s -w "\n%{http_code}" -X POST \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d "{\"data\":{\"type\":\"reviewSubmissionItems\",\"relationships\":{\"reviewSubmission\":{\"data\":{\"id\":\"$REVIEW_SUBMISSION_ID\",\"type\":\"reviewSubmissions\"}},\"appStoreVersion\":{\"data\":{\"id\":\"$VERSION_ID\",\"type\":\"appStoreVersions\"}}}}}" \
+  "https://api.appstoreconnect.apple.com/v1/reviewSubmissionItems")
+
+ADD_ITEM_HTTP=$(echo "$ADD_ITEM_RESP" | tail -1)
+ADD_ITEM_BODY=$(echo "$ADD_ITEM_RESP" | sed '$d')
+
+echo "Request:"
+echo "  POST https://api.appstoreconnect.apple.com/v1/reviewSubmissionItems"
+echo "Response HTTP: $ADD_ITEM_HTTP"
+echo "Response Body: $ADD_ITEM_BODY"
+
+if [ "$ADD_ITEM_HTTP" = "201" ]; then
+  echo "App Store version added to review submission"
+elif [ "$ADD_ITEM_HTTP" = "409" ]; then
+  IS_ANOTHER=$(echo "$ADD_ITEM_BODY" | python3 -c "
+import sys, json
+try:
+    errors = json.load(sys.stdin).get('errors', [])
+    for e in errors:
+        detail = e.get('detail', '')
+        if 'another' in detail.lower() or 'ITEM_PART_OF_ANOTHER' in e.get('code', ''):
+            print('yes')
+            break
+except: pass
+" 2>/dev/null)
+
+  if [ "$IS_ANOTHER" = "yes" ]; then
+    echo "Version is still in another submission — attempting cleanup..."
+    FIND_SUBS=$(curl -s \
+      -H "Authorization: Bearer $JWT" \
+      "https://api.appstoreconnect.apple.com/v1/apps/$APP_ID/reviewSubmissions")
+    OTHER_SUB_IDS=$(echo "$FIND_SUBS" | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+my_sub = '$REVIEW_SUBMISSION_ID'
+active = {'READY_FOR_REVIEW', 'WAITING_FOR_REVIEW', 'IN_REVIEW', 'UNRESOLVED_ISSUES', 'COMPLETING'}
+for s in data:
+    if s['id'] != my_sub and s['attributes']['state'] in active:
+        print(s['id'], s['attributes']['state'])
+" 2>/dev/null)
+    echo "$OTHER_SUB_IDS" | while read OTHER_ID OTHER_STATE; do
+      [ -z "$OTHER_ID" ] && continue
+      echo "  Canceling other submission $OTHER_ID ($OTHER_STATE)..."
+      curl -s -X PATCH \
+        -H "Authorization: Bearer $JWT" \
+        -H "Content-Type: application/json" \
+        -d "{\"data\":{\"id\":\"$OTHER_ID\",\"type\":\"reviewSubmissions\",\"attributes\":{\"canceled\":true}}}" \
+        "https://api.appstoreconnect.apple.com/v1/reviewSubmissions/$OTHER_ID" > /dev/null 2>&1
+    done
+    sleep 10
+
+    echo "  Retrying add item..."
+    ADD_ITEM_RESP2=$(curl -s -w "\n%{http_code}" -X POST \
+      -H "Authorization: Bearer $JWT" \
+      -H "Content-Type: application/json" \
+      -d "{\"data\":{\"type\":\"reviewSubmissionItems\",\"relationships\":{\"reviewSubmission\":{\"data\":{\"id\":\"$REVIEW_SUBMISSION_ID\",\"type\":\"reviewSubmissions\"}},\"appStoreVersion\":{\"data\":{\"id\":\"$VERSION_ID\",\"type\":\"appStoreVersions\"}}}}}" \
+      "https://api.appstoreconnect.apple.com/v1/reviewSubmissionItems")
+    ADD_ITEM_HTTP2=$(echo "$ADD_ITEM_RESP2" | tail -1)
+    if [ "$ADD_ITEM_HTTP2" = "201" ]; then
+      echo "  App Store version added on retry"
+    elif [ "$ADD_ITEM_HTTP2" = "409" ]; then
+      echo "  Still 409 on retry — version may already be in our submission (continuing)"
+    else
+      echo "  Retry failed HTTP $ADD_ITEM_HTTP2"
+    fi
+  else
+    echo "Version already part of this submission (409) — continuing to Step 13c"
+  fi
+else
+  rm -f /tmp/AuthKey_${KEY_ID}.p8
+  echo "Step 13b failed (HTTP $ADD_ITEM_HTTP): $ADD_ITEM_BODY"
+  exit 1
+fi
+
+# -- Step 13c: Submit for review (PATCH submitted=true) --
+echo "Step 13c: Submitting for review..."
+SUBMIT_SUCCESS="false"
+for submit_attempt in 1 2 3; do
+  SUBMIT_RESP=$(curl -s -w "\n%{http_code}" -X PATCH \
+    -H "Authorization: Bearer $JWT" \
+    -H "Content-Type: application/json" \
+    -d "{\"data\":{\"id\":\"$REVIEW_SUBMISSION_ID\",\"type\":\"reviewSubmissions\",\"attributes\":{\"submitted\":true}}}" \
+    "https://api.appstoreconnect.apple.com/v1/reviewSubmissions/$REVIEW_SUBMISSION_ID")
+
+  HTTP=$(echo "$SUBMIT_RESP" | tail -1)
+  BODY=$(echo "$SUBMIT_RESP" | sed '$d')
+
+  echo "Request (attempt $submit_attempt/3):"
+  echo "  PATCH https://api.appstoreconnect.apple.com/v1/reviewSubmissions/$REVIEW_SUBMISSION_ID"
+  echo "  Body: {\"data\":{\"id\":\"$REVIEW_SUBMISSION_ID\",\"type\":\"reviewSubmissions\",\"attributes\":{\"submitted\":true}}}"
+  echo "Response HTTP: $HTTP"
+  echo "Response Body: $BODY"
+
+  if [ "$HTTP" = "200" ]; then
+    echo "Submitted for review — Waiting for Review"
+    SUBMIT_SUCCESS="true"
+    break
+  elif [ "$HTTP" = "409" ] && [ "$submit_attempt" -lt 3 ]; then
+    echo "  409 conflict — ASC may still be processing. Waiting 15s before retry..."
+    sleep 15
+    continue
+  elif [ "$HTTP" = "403" ]; then
+    echo "Submit failed 403 — API key needs App Manager or Admin role in App Store Connect."
+    echo "   Go to Users & Access -> API Keys -> verify this key has App Manager or Admin role."
+    echo "   All prior steps succeeded. Submit manually in App Store Connect if needed."
+    break
+  elif [ "$HTTP" = "409" ]; then
+    echo "Submit failed 409 after 3 attempts — Version may not be ready to be submitted."
+    echo "   Common causes: build still processing, missing required metadata/screenshots."
+    echo "   Check App Store Connect for the current status of this version."
+    break
+  else
+    echo "Submit failed (HTTP $HTTP): $BODY"
+    echo "   Common cause: missing screenshots or required metadata on the version."
+    echo "   Fix in App Store Connect, then re-trigger or submit manually."
+    break
+  fi
+done
+
+rm -f /tmp/AuthKey_${KEY_ID}.p8
+```
+
+---
+
+## Step Report (REQUIRED — always print at end of every run)
+
+After every run (success or failure), Cursor MUST print a table like this:
+```
+================================================
+  UPLOAD REPORT — v<VERSION> (<BUILD_NUMBER>)
+  Framework: <flutter / react-native / swift>
+  Mode: <A: TestFlight Only | B: Full Submission>
+================================================
+  Step 0   Credentials collected        OK (KEY_ID: <first 4 chars>..., framework: <framework>)
+  Step 1   Export Compliance fix        OK / already present
+  Step 2   Build IPA (<framework>)      OK success (~Xm Xs) / FAIL <error>
+  Step 3   Bundle info extracted        OK <bundle_id> v<version> (<build>)
+  Step 4   .p8 key written              OK
+  Step 4b  altool upload                OK Delivery ID: <id> (~Xm Xs) / FAIL <error>
+  -- Mode B only ------------------------------------
+  Step 6   JWT generated                OK / FAIL PyJWT error
+  Step 7   App ID resolved              OK <app_id> / FAIL <error>
+  Step 8   Build found in ASC           OK <build_id> (~Xm wait) / FAIL timeout
+  Step 9   TF notes <locale_1>          OK created/updated / FAIL <error>
+  Step 9   TF notes <locale_2>          OK created/updated / FAIL <error>
+  Step 9   TF notes <locale_N>          (one row per locale the user provided)
+  Step 10  App Store version            OK created/reused <version_id> (state: <state>) / FAIL <error>
+  Step 10b Cancel blocking submissions  OK canceled N / skipped / FAIL <error>
+  Step 11  AS notes <locale_1>          OK / WARN non-fatal after retries / FAIL <error>
+  Step 11  AS notes <locale_2>          OK / WARN non-fatal after retries / FAIL <error>
+  Step 11  AS notes <locale_N>          (one row per locale the user provided)
+  Step 12  Build attached               OK / FAIL <error>
+  Step 13-pre Clear blocking subs       OK cleared N subs / none found
+  Step 13a Review submission            OK created/reused <submission_id> / FAIL <error>
+  Step 13b Version added to submission  OK / WARN resolved ITEM_PART_OF_ANOTHER (409) / FAIL <error>
+  Step 13c Submitted for review         OK Waiting for Review / FAIL <error + guidance>
+================================================
+```
+
+Fill in actual values. Never skip this report even on full success.
+
+---
+
+## Guardrails
+
+- **Never hardcode credentials.** Always use the `$KEY_ID`, `$ISSUER_ID`, and `$P8_KEY` provided by the user in chat. If not provided, ask for them.
+- **No flavors.** This rule does not use `--flavor` or `--target` flags. It builds the default app configuration.
+- `testflight` keyword in trigger (case-insensitive) = Mode A. No notes asked. No App Store steps.
+- Without `testflight` = Mode B. Always require **at least one** locale with notes before starting. The user can provide any number of locales.
+- Normalize locale aliases to Apple's `xx-XX` format (see locale parsing rules in Mode B trigger section). Convert underscores to hyphens. Use the alias table for common languages; for unknown aliases, convert `xx_YY` to `xx-YY` and pass through.
+- Same notes used for both TestFlight "What to Test" AND App Store "What's New" — applied per locale.
+- Steps 9 and 11 iterate over ALL locales the user provided. The step report must show one row per locale for both Step 9 and Step 11.
+- Never hardcode IPA filename — always use `find build/ios/ipa -name "*.ipa" | head -1`.
+- Never use shell openssl for JWT — always use Python PyJWT (ES256 only works correctly via a proper JWT library).
+- Never add `fields[apps]=id` to app list URL — Apple returns 400 for field "id".
+- Never add `fields[betaBuildLocalizations]=...` to localization list URLs — it can hide existing records.
+- If a version exists in ANY actionable state for the same version string, reuse it — never create a duplicate.
+- altool upload can take 15-20 minutes. Never kill it. Never set a timeout shorter than 25 minutes on the runner.
+- App Store Connect build processing can take 10-15 minutes post-upload. Poll for 20 minutes before giving up.
+- **Never** use the deprecated `POST /v1/appStoreVersionSubmissions` endpoint — it returns 403 FORBIDDEN_ERROR. Always use the `reviewSubmissions` + `reviewSubmissionItems` flow.
+- **Step 13-pre** must cancel ALL blocking review submissions before creating a new one.
+- **Step 13c** retry up to 3 times with 15s delay for 409 "Version is not ready yet".
+- If Step 13c returns 403: the key may lack App Manager/Admin role — report this clearly.
+- Always `chmod 600` the .p8 key and always delete it in the final step, even on early failure.
+- Always print the Step Report at the end of every run.
+- **All three frameworks produce an IPA at the end.** The upload process (Steps 3-13) is identical regardless of framework. Only Step 1 (Info.plist path) and Step 2 (build command) differ.
+
+## Framework-specific notes
+
+### Flutter
+- Build command: `flutter build ipa` (no flavor, no target)
+- IPA output: `build/ios/ipa/`
+- Info.plist: `ios/Runner/Info.plist`
+
+### React Native
+- Build: two-step `xcodebuild archive` then `xcodebuild -exportArchive`
+- Workspace: auto-detected from `ios/*.xcworkspace`
+- Scheme: auto-detected via `xcodebuild -list`
+- IPA output: `build/ios/ipa/` (set via `-exportPath`)
+- Info.plist: `ios/<ProjectName>/Info.plist` (auto-detected)
+- ExportOptions.plist: generated at `/tmp/ExportOptions.plist` with method `app-store-connect`
+
+### Native Swift / Xcode
+- Build: two-step `xcodebuild archive` then `xcodebuild -exportArchive`
+- Workspace or project: auto-detected from root directory
+- Scheme: auto-detected via `xcodebuild -list`
+- IPA output: `build/ios/ipa/` (set via `-exportPath`)
+- Info.plist: auto-detected via `find`
+- ExportOptions.plist: same as React Native
+
+## Scenarios handled by Steps 10/10b/13
+
+| # | Scenario | Version state before | What happens |
+|---|----------|---------------------|--------------|
+| 1 | Brand new version (first time) | N/A | Step 10 creates new version -> Steps 11-13 proceed normally |
+| 2 | New build, version exists, never submitted | PREPARE_FOR_SUBMISSION | Step 10 reuses -> Step 10b checks -> Steps 11-13 proceed normally |
+| 3 | New build, Apple rejected the previous build | REJECTED / METADATA_REJECTED | Step 10 reuses -> Step 10b cancels UNRESOLVED_ISSUES -> Steps 11-13 clean-create |
+| 4 | New build, developer removed version from review | DEVELOPER_REJECTED | Step 10 reuses -> Step 10b cancels lingering submissions -> Steps 11-13 clean-create |
+| 5 | New build, previous build is currently in review | WAITING_FOR_REVIEW / IN_REVIEW | Step 10 reuses -> Step 10b cancels active submission -> Steps 11-13 clean-create |
+| 6 | New build, Apple approved but not released | PENDING_DEVELOPER_RELEASE | Step 10 reuses -> Step 10b cancels submission -> Steps 11-13 clean-create |
+| 7 | New build, Apple holding for OS release | PENDING_APPLE_RELEASE | Step 10 reuses -> Step 10b cancels submission -> Steps 11-13 clean-create |
+| 8 | New build, draft version with stale submission | PREPARE_FOR_SUBMISSION + READY_FOR_REVIEW sub | Step 10 reuses -> Step 10b cancels stale sub -> Steps 11-13 clean-create |
+| 9 | New build, waiting for export compliance | WAITING_FOR_EXPORT_COMPLIANCE | Step 10 reuses -> Step 10b cancels submission -> Steps 11-13 clean-create |
